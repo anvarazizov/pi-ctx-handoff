@@ -22,12 +22,18 @@
  * it falls through to pi's default compaction by returning undefined.
  *
  * Configuration (first match wins, per field):
- *   1. Environment: PI_HANDOFF_PROVIDER, PI_HANDOFF_MODEL, PI_HANDOFF_THRESHOLD
+ *   1. Environment: PI_HANDOFF_PROVIDER, PI_HANDOFF_MODEL, PI_HANDOFF_THRESHOLD,
+ *      PI_HANDOFF_FALLBACK_PROVIDER, PI_HANDOFF_FALLBACK_MODEL
  *   2. Project file: <project>/.pi/ctx-handoff.json (found by walking up
  *      from the session's working directory; nearest wins)
- *      { "provider": "lm-studio", "modelId": "qwen/qwen3.8-27b", "threshold": 90 }
+ *      { "provider": "lm-studio", "modelId": "qwen/qwen3.8-27b", "threshold": 90,
+ *        "fallbackProvider": "lm-studio-gemma", "fallbackModelId": "google/gemma-4-26b" }
  *   3. Global file: ~/.pi/agent/ctx-handoff.json
- *   4. Defaults: lm-studio / qwen/qwen3.8-27b / 90
+ *   4. Defaults: lm-studio / qwen/qwen3.8-27b / 90, no fallback
+ *
+ * When fallbackProvider/fallbackModelId are set, a missing or failing
+ * primary model retries once on the fallback before giving up to pi's
+ * default compaction. User aborts never escalate to the fallback.
  *
  * Project files let each repository pick its own summarizer model and
  * threshold (e.g. a beefier model for a huge codebase, a lower threshold
@@ -58,6 +64,10 @@ interface HandoffConfig {
 	modelId: string;
 	/** Context usage percent (0–100) that triggers a handoff compaction. */
 	threshold: number;
+	/** Optional fallback summarizer, used when the primary model is missing
+	 *  or its request fails. Both fields must be set to enable it. */
+	fallbackProvider?: string;
+	fallbackModelId?: string;
 }
 
 const DEFAULT_CONFIG: HandoffConfig = {
@@ -113,6 +123,8 @@ function loadConfig(cwd: string): HandoffConfig {
 		threshold: Number.isFinite(envThreshold)
 			? envThreshold
 			: (merged.threshold ?? DEFAULT_CONFIG.threshold),
+		fallbackProvider: process.env.PI_HANDOFF_FALLBACK_PROVIDER ?? merged.fallbackProvider,
+		fallbackModelId: process.env.PI_HANDOFF_FALLBACK_MODEL ?? merged.fallbackModelId,
 	};
 
 	if (!Number.isFinite(config.threshold) || config.threshold <= 0 || config.threshold > 100) {
@@ -324,26 +336,28 @@ export default function (pi: ExtensionAPI) {
 			settings,
 		} = preparation;
 
-		const model = ctx.modelRegistry.find(config.provider, config.modelId);
-		if (!model) {
+		const primary = ctx.modelRegistry.find(config.provider, config.modelId);
+		const fallback = config.fallbackProvider && config.fallbackModelId
+			? ctx.modelRegistry.find(config.fallbackProvider, config.fallbackModelId)
+			: undefined;
+
+		if (!primary && !fallback) {
 			if (ctx.hasUI)
 				ctx.ui.notify(
-					`Handoff model ${config.provider}/${config.modelId} not found — using default compaction`,
+					`Handoff model ${config.provider}/${config.modelId} not found${config.fallbackProvider ? ` (fallback ${config.fallbackProvider}/${config.fallbackModelId} not found either)` : ""} — using default compaction`,
 					"warning",
 				);
 			return; // fall through to default compaction
 		}
+		if (!primary && fallback && ctx.hasUI) {
+			ctx.ui.notify(
+				`Handoff model ${config.provider}/${config.modelId} not found — trying fallback ${config.fallbackModelId}`,
+				"warning",
+			);
+		}
 
 		const allMessages = [...messagesToSummarize, ...turnPrefixMessages];
 		if (allMessages.length === 0) return;
-
-		// Same token budget as native compaction:
-		// min(0.8 * reserveTokens, model max output), where reserveTokens is
-		// the effective setting (respects settings.json + per-model overrides).
-		const maxTokens = Math.min(
-			Math.floor(0.8 * settings.reserveTokens),
-			model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-		);
 
 		// Strip our routing marker; keep the rest as a native-style focus hint.
 		const customInstructions = event.customInstructions
@@ -371,13 +385,19 @@ export default function (pi: ExtensionAPI) {
 			},
 		];
 
-		if (ctx.hasUI)
-			ctx.ui.notify(
-				`Handoff: summarizing ${allMessages.length} messages (~${tokensBefore.toLocaleString()} tokens, max ${maxTokens.toLocaleString()} out) via ${config.modelId}...`,
-				"info",
+		// One summarization attempt against a specific model. Returns the
+		// summary text and provider usage, or throws on failure (request error,
+		// empty output). Token budget per attempt, same formula as native.
+		const attemptWith = async (model: NonNullable<ReturnType<typeof ctx.modelRegistry.find>>) => {
+			const maxTokens = Math.min(
+				Math.floor(0.8 * settings.reserveTokens),
+				model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 			);
-
-		try {
+			if (ctx.hasUI)
+				ctx.ui.notify(
+					`Handoff: summarizing ${allMessages.length} messages (~${tokensBefore.toLocaleString()} tokens, max ${maxTokens.toLocaleString()} out) via ${model.id}...`,
+					"info",
+				);
 			const response = await ctx.modelRegistry.complete(
 				model,
 				{
@@ -387,46 +407,70 @@ export default function (pi: ExtensionAPI) {
 				},
 				{
 					maxTokens,
-					signal,
+				signal,
 					cacheRetention: "none",
 					sessionId: uuidv7(), // one-off prompt, not reused
 				},
 			);
-
-			if (signal.aborted) return; // user cancelled → default compaction
-
+			if (signal.aborted) throw new Error("aborted");
 			const summary = response.content
 				.filter((c): c is { type: "text"; text: string } => c.type === "text")
 				.map((c) => c.text)
 				.join("\n")
 				.trim();
+			if (!summary) throw new Error("empty summary");
+			return { summary, usage: response.usage };
+		};
 
-			if (!summary) {
-				if (ctx.hasUI) ctx.ui.notify("Handoff summary was empty — using default compaction", "warning");
-				return;
+		// Try the primary, then the fallback. Abort never escalates to the
+		// fallback — the user cancelled, so default compaction takes over.
+		let result: Awaited<ReturnType<typeof attemptWith>> | undefined;
+		if (primary) {
+			try {
+				result = await attemptWith(primary);
+			} catch (error) {
+				if (signal.aborted) return; // user cancelled → default compaction
+				const message = error instanceof Error ? error.message : String(error);
+				if (fallback) {
+						if (ctx.hasUI)
+							ctx.ui.notify(
+								`Handoff via ${primary.id} failed: ${message} — trying fallback ${fallback.id}`,
+								"warning",
+						);
+					} else if (ctx.hasUI) {
+						ctx.ui.notify(`Handoff generation failed: ${message} — using default compaction`, "error");
+					}
 			}
-
-			// Same file-list appendix as native compaction, so the next
-			// context keeps cumulative read/modified file tracking.
-			const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-
-			if (ctx.hasUI) ctx.ui.notify("Handoff summary ready — applying compaction", "info");
-
-			return {
-				compaction: {
-					summary: summary + formatFileOperations(readFiles, modifiedFiles),
-					firstKeptEntryId, // keep the recent ~20k tail
-					tokensBefore,
-					usage: response.usage, // counted in session totals
-					details: { readFiles, modifiedFiles }, // native details format
-				},
-			};
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (ctx.hasUI)
-				ctx.ui.notify(`Handoff generation failed: ${message} — using default compaction`, "error");
-			return; // fall through to default compaction
 		}
+		if (!result && fallback && !signal.aborted) {
+			try {
+				result = await attemptWith(fallback);
+			} catch (error) {
+				if (signal.aborted) return;
+				const message = error instanceof Error ? error.message : String(error);
+				if (ctx.hasUI)
+						ctx.ui.notify(`Handoff generation failed: ${message} — using default compaction`, "error");
+			}
+		}
+
+		if (signal.aborted) return; // user cancelled → default compaction
+		if (!result) return; // both models failed → default compaction
+
+		// Same file-list appendix as native compaction, so the next
+		// context keeps cumulative read/modified file tracking.
+		const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+
+		if (ctx.hasUI) ctx.ui.notify("Handoff summary ready — applying compaction", "info");
+
+		return {
+			compaction: {
+				summary: result.summary + formatFileOperations(readFiles, modifiedFiles),
+				firstKeptEntryId, // keep the recent ~20k tail
+				tokensBefore,
+				usage: result.usage, // counted in session totals
+				details: { readFiles, modifiedFiles }, // native details format
+			},
+		};
 	});
 
 	// --- Manual /handoff command --------------------------------------------

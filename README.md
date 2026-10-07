@@ -22,9 +22,9 @@ main model (expensive, big context)          handoff model (cheap, fast)
 | Piece | Behavior |
 |---|---|
 | `turn_end` hook | Watches context usage each turn. When it crosses the threshold (default **90%**), fires a handoff compaction once, then re-arms. Shows a `ctx NN%` footer status (with `⚡handoff` when armed-hot). |
-| `session_before_compact` hook | Intercepts the compaction pi already prepared (same cut point, same kept tail of ~20k recent tokens), serializes the messages pi selected, and asks the configured **handoff model** for the summary. |
+| `session_before_compact` hook | Intercepts the compaction pi already prepared (same cut point, same kept tail of ~20k recent tokens), serializes the messages pi selected, and asks the configured **handoff model** for the summary. If the handoff model is missing or fails and a **fallback model** is configured, the request is retried once on the fallback. |
 | `/handoff` command | Fires the same compaction manually, at any context level. |
-| Fallback | If the handoff model is missing, the summary is empty, the request fails, or you cancel — the extension steps aside and pi's **default compaction** runs instead. Nothing breaks. |
+| Fallback | If the handoff model is missing, the summary is empty, the request fails, or you cancel — the extension steps aside and pi's **default compaction** runs instead. Nothing breaks. With a configured fallback model, a failed primary gets one retry on the fallback first (user aborts never escalate). |
 
 Plain `/compact` and overflow-recovery compactions always use pi's default summarizer; only threshold-triggered and `/handoff` compactions go through the handoff model.
 
@@ -75,9 +75,13 @@ The handoff model must be registered in pi (see `~/.pi/agent/models.json` or the
 {
 	"provider": "lm-studio",
 	"modelId": "qwen/qwen3.8-27b",
-	"threshold": 90
+	"threshold": 90,
+	"fallbackProvider": "lm-studio",
+	"fallbackModelId": "google/gemma-4-26b"
 }
 ```
+
+**Fallback model** — optional. When `fallbackProvider` + `fallbackModelId` are set, a missing or failing primary summarizer gets one retry on the fallback before compaction falls back to pi's default. Handy when the primary summarizer is a local server that's sometimes down: configure a second local server (or a cheap API model) as the safety net. Leave both fields out (or empty) to disable.
 
 **Per-project override** — `<project>/.pi/ctx-handoff.json`. Any field you set overrides the global file; fields you omit fall through. Useful for giving one repository a beefier summarizer or a lower threshold for long agent runs:
 
@@ -97,6 +101,8 @@ Config is re-read on every event, so edits apply to the next compaction without 
 | `PI_HANDOFF_PROVIDER` | pi provider id of the summarizer model | `lm-studio` |
 | `PI_HANDOFF_MODEL` | model id within that provider | `qwen/qwen3.8-27b` |
 | `PI_HANDOFF_THRESHOLD` | context usage % that triggers compaction (1–100) | `90` |
+| `PI_HANDOFF_FALLBACK_PROVIDER` | fallback summarizer provider (optional) | — |
+| `PI_HANDOFF_FALLBACK_MODEL` | fallback summarizer model id (optional) | — |
 
 Pick any model you like — a small local Qwen/Gemma via LM Studio, Gemini Flash, or a cheap API model. It just needs to follow the structured-summary format reliably.
 

@@ -1,8 +1,9 @@
 {
 	"name": "pi-ctx-handoff",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"description": "pi extension: compact context with a dedicated summarizer model, using pi's native compaction prompts and token budget",
 	"license": "MIT",
+	"type": "module",
 	"author": "Anvar Azizov",
 	"keywords": [
 		"pi-package",
@@ -18,13 +19,17 @@
 		"url": "git+https://github.com/anvarazizov/pi-ctx-handoff.git"
 	},
 	"pi": {
-		"extensions": ["./extensions/ctx-handoff.ts"]
+		"extensions": [
+			"./extensions/ctx-handoff.ts"
+		]
 	},
 	"scripts": {
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "tsx tests/handoff.test.ts"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "^1.0.0",
+		"tsx": "^4.23.15",
 		"typescript": "^5.0.0"
 	}
 }
