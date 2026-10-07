@@ -21,11 +21,18 @@
  * On any failure (model missing, empty output, network error, user abort)
  * it falls through to pi's default compaction by returning undefined.
  *
- * Configuration (first match wins):
+ * Configuration (first match wins, per field):
  *   1. Environment: PI_HANDOFF_PROVIDER, PI_HANDOFF_MODEL, PI_HANDOFF_THRESHOLD
- *   2. Config file: ~/.pi/agent/ctx-handoff.json
+ *   2. Project file: <project>/.pi/ctx-handoff.json (found by walking up
+ *      from the session's working directory; nearest wins)
  *      { "provider": "lm-studio", "modelId": "qwen/qwen3.8-27b", "threshold": 90 }
- *   3. Defaults: lm-studio / qwen/qwen3.8-27b / 90
+ *   3. Global file: ~/.pi/agent/ctx-handoff.json
+ *   4. Defaults: lm-studio / qwen/qwen3.8-27b / 90
+ *
+ * Project files let each repository pick its own summarizer model and
+ * threshold (e.g. a beefier model for a huge codebase, a lower threshold
+ * for long agent runs) without touching global settings. Config is read
+ * per event, so edits apply to the next compaction without a reload.
  *
  * The model must be registered in pi (providers/models in ~/.pi/agent/models.json
  * or project .pi/models.json) and resolvable via the model registry.
@@ -59,27 +66,53 @@ const DEFAULT_CONFIG: HandoffConfig = {
 	threshold: 90,
 };
 
-function loadConfig(): HandoffConfig {
-	// Optional JSON config file, e.g. for machines where env vars are not
-	// reliably set (GUI launches, launchers, containers).
-	let file: Partial<HandoffConfig> = {};
+function readConfigFile(filePath: string): Partial<HandoffConfig> {
 	try {
-		const configPath = path.join(homedir(), ".pi", "agent", "ctx-handoff.json");
-		file = JSON.parse(readFileSync(configPath, "utf8")) as Partial<HandoffConfig>;
+		return JSON.parse(readFileSync(filePath, "utf8")) as Partial<HandoffConfig>;
 	} catch {
-		// No config file (or unreadable) — env vars and defaults still apply.
+		// Missing or unreadable — other config sources still apply.
+		return {};
 	}
+}
+
+/**
+ * Project-local config: <dir>/.pi/ctx-handoff.json, discovered by walking up
+ * from the session's working directory (mirrors pi's project discovery, so
+ * launching pi from a subdirectory still finds the project root). The
+ * nearest file wins.
+ */
+function findProjectConfig(cwd: string): Partial<HandoffConfig> {
+	let dir = path.resolve(cwd);
+	for (;;) {
+		const config = readConfigFile(path.join(dir, ".pi", "ctx-handoff.json"));
+		if (Object.keys(config).length > 0) return config;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return {};
+}
+
+/**
+ * Resolve the effective config. Per field, highest priority first:
+ * env vars → project .pi/ctx-handoff.json → global ~/.pi/agent/ctx-handoff.json
+ * → defaults. Read per event so config edits apply without a reload.
+ */
+function loadConfig(cwd: string): HandoffConfig {
+	const global = readConfigFile(path.join(homedir(), ".pi", "agent", "ctx-handoff.json"));
+	const project = findProjectConfig(cwd);
+	const merged = { ...global, ...project };
 
 	const envThreshold = process.env.PI_HANDOFF_THRESHOLD
 		? Number(process.env.PI_HANDOFF_THRESHOLD)
 		: NaN;
 
 	const config: HandoffConfig = {
-		provider: process.env.PI_HANDOFF_PROVIDER ?? file.provider ?? DEFAULT_CONFIG.provider,
-		modelId: process.env.PI_HANDOFF_MODEL ?? file.modelId ?? DEFAULT_CONFIG.modelId,
+		provider: process.env.PI_HANDOFF_PROVIDER ?? merged.provider ?? DEFAULT_CONFIG.provider,
+		modelId: process.env.PI_HANDOFF_MODEL ?? merged.modelId ?? DEFAULT_CONFIG.modelId,
 		threshold: Number.isFinite(envThreshold)
 			? envThreshold
-			: (file.threshold ?? DEFAULT_CONFIG.threshold),
+			: (merged.threshold ?? DEFAULT_CONFIG.threshold),
 	};
 
 	if (!Number.isFinite(config.threshold) || config.threshold <= 0 || config.threshold > 100) {
@@ -204,7 +237,9 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
 // ----------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	const config = loadConfig();
+	// Config is resolved per event (each handler has ctx.cwd), so project
+	// configs apply in the right session and edits don't need a reload.
+	const cfg = (ctx: ExtensionContext): HandoffConfig => loadConfig(ctx.cwd);
 
 	// Armed-flag model: fire once when over threshold, then stay disarmed
 	// until compaction completes (which re-arms). This correctly handles a
@@ -214,6 +249,7 @@ export default function (pi: ExtensionAPI) {
 	let handoffInFlight = false;
 
 	const trigger = (ctx: ExtensionContext, manual = false) => {
+		const config = cfg(ctx);
 		if (handoffInFlight) return;
 		handoffInFlight = true;
 		if (ctx.hasUI) {
@@ -240,22 +276,22 @@ export default function (pi: ExtensionAPI) {
 	// Also updates the footer status with the current ctx % each turn.
 	// percent is 0–100 (see pi's agent-session.js: `(tokens/contextWindow)*100`),
 	// so the threshold is in percent and displays must NOT multiply by 100.
-	const fmtStatus = (pct: number | null): string => {
+	const fmtStatus = (ctx: ExtensionContext, pct: number | null): string => {
 		if (pct === null) return "ctx ?%";
-		const tag = pct >= config.threshold ? " ⚡handoff" : "";
+		const tag = pct >= cfg(ctx).threshold ? " ⚡handoff" : "";
 		return `ctx ${Math.round(pct)}%${tag}`;
 	};
 
 	pi.on("turn_end", (_event, ctx) => {
 		const usage = ctx.getContextUsage();
 		const pct = usage?.percent ?? null;
-		if (ctx.hasUI) ctx.ui.setStatus("ctx-handoff", fmtStatus(pct));
+		if (ctx.hasUI) ctx.ui.setStatus("ctx-handoff", fmtStatus(ctx, pct));
 		if (pct === null) return;
 		// Fire on the first turn we're over threshold while armed; the
 		// in-flight + armed flags keep it from re-firing every turn while
 		// we wait for compaction to finish, and re-arming after completion
 		// lets it fire again on the next cycle.
-		if (pct >= config.threshold && armed && !handoffInFlight) {
+		if (pct >= cfg(ctx).threshold && armed && !handoffInFlight) {
 			armed = false;
 			trigger(ctx);
 		}
@@ -276,6 +312,7 @@ export default function (pi: ExtensionAPI) {
 			event.reason === "manual" && event.customInstructions?.includes(MANUAL_HANDOFF_MARKER);
 		if (event.reason !== "threshold" && !isManualHandoff) return;
 
+		const config = cfg(ctx);
 		const { preparation, signal } = event;
 		const {
 			messagesToSummarize,
@@ -396,6 +433,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("handoff", {
 		description: "Trigger a context-handoff compaction now (summary via the handoff model)",
 		handler: async (_args, ctx) => {
+			const config = cfg(ctx);
 			const usage = ctx.getContextUsage();
 			const pct = usage?.percent ?? null;
 			// If over threshold, the auto-detector fires on the next turn_end;

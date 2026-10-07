@@ -1,6 +1,6 @@
 {
 	"name": "pi-ctx-handoff",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"description": "pi extension: compact context with a dedicated summarizer model, using pi's native compaction prompts and token budget",
 	"license": "MIT",
 	"author": "Anvar Azizov",

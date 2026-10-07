@@ -62,9 +62,14 @@ Copy [`extensions/ctx-handoff.ts`](extensions/ctx-handoff.ts) to `~/.pi/agent/ex
 
 ## Configure
 
-The handoff model must be registered in pi (see `~/.pi/agent/models.json` or the [custom models docs](https://github.com/earendil-works/pi)). Configuration resolves in order: **env vars → config file → defaults**.
+The handoff model must be registered in pi (see `~/.pi/agent/models.json` or the [custom models docs](https://github.com/earendil-works/pi)). Configuration resolves per field, highest priority first:
 
-**Config file** — `~/.pi/agent/ctx-handoff.json`:
+1. **Environment variables** — override everything
+2. **Project file** — `<project>/.pi/ctx-handoff.json` (found by walking up from the session's working directory, so launching pi from a subdirectory works; nearest file wins)
+3. **Global file** — `~/.pi/agent/ctx-handoff.json`
+4. **Defaults**
+
+**Global file** — `~/.pi/agent/ctx-handoff.json`:
 
 ```json
 {
@@ -74,7 +79,18 @@ The handoff model must be registered in pi (see `~/.pi/agent/models.json` or the
 }
 ```
 
-**Environment variables** (override the file):
+**Per-project override** — `<project>/.pi/ctx-handoff.json`. Any field you set overrides the global file; fields you omit fall through. Useful for giving one repository a beefier summarizer or a lower threshold for long agent runs:
+
+```json
+{
+	"modelId": "qwen/qwen3.8-72b",
+	"threshold": 80
+}
+```
+
+Config is re-read on every event, so edits apply to the next compaction without restarting pi.
+
+**Environment variables** (override both files):
 
 | Variable | Meaning | Default |
 |---|---|---|
